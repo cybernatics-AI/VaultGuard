@@ -1,5 +1,7 @@
 ;; Multi-Signature Crypto Treasury
-;; This contract implements a crypto treasury with multiple signers who can collectively
+;; Version 1.0: Organizational treasury with multi-signature security
+;; This contract implements a crypto treasury with multi-signature approval capabilities.
+;; The treasury allows designating "signers" who can collectively authorize transactions if the admin is unavailable.
 
 ;; Define fungible token trait
 (define-trait ft-trait
@@ -21,9 +23,12 @@
 (define-constant ERR_NO_PROPOSAL_EXISTS (err u106))
 (define-constant ERR_ALREADY_APPROVED (err u107))
 (define-constant ERR_INSUFFICIENT_APPROVALS (err u108))
+(define-constant ERR_PROPOSAL_EXPIRED (err u109))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u110))
+(define-constant ERR_INVALID_APPROVAL_PERCENTAGE (err u111))
 (define-constant ERR_NULL_ADDRESS (err u112))
 (define-constant ERR_INVALID_AMOUNT (err u113))
+(define-constant ERR_INVALID_TOKEN (err u114))
 
 ;; Data variables
 
@@ -39,16 +44,20 @@
 ;; Total number of signers
 (define-data-var signer-count uint u0)
 
-;; Required number of approvals
-(define-data-var required-approvals uint u2)
+;; Approval percentage required for transactions (percentage 1-100)
+(define-data-var approval-percentage uint u51)
 
 ;; Proposal state
 (define-data-var proposal-active bool false)
-(define-data-var proposal-new-admin (optional principal) none)
+(define-data-var proposal-creator (optional principal) none)
+(define-data-var proposal-beneficiary (optional principal) none)
+(define-data-var proposal-deadline uint u0)
 (define-map proposal-approvals principal bool)
 (define-data-var approval-count uint u0)
 
 ;; Constants
+(define-constant SECONDS_IN_DAY u86400)
+(define-constant PROPOSAL_VALIDITY_DAYS u3)
 (define-constant NULL_ADDRESS 'SP000000000000000000002Q6VF78)
 
 ;; Read-only functions
@@ -61,18 +70,43 @@
 (define-read-only (is-signer (signer principal))
   (default-to false (map-get? signers signer)))
 
-;; Get required approvals
-(define-read-only (get-required-approvals)
-  (var-get required-approvals))
+;; Get approval percentage
+(define-read-only (get-approval-percentage)
+  (var-get approval-percentage))
 
 ;; Check if proposal is active
 (define-read-only (proposal-status)
   {
     active: (var-get proposal-active),
-    new-admin: (var-get proposal-new-admin),
+    created-by: (var-get proposal-creator),
+    beneficiary: (var-get proposal-beneficiary),
+    deadline: (var-get proposal-deadline),
     current-approvals: (var-get approval-count),
-    required-approvals: (var-get required-approvals)
+    required-approvals: (calculate-required-approvals)
   })
+
+;; Calculate required number of approvals based on percentage
+(define-read-only (calculate-required-approvals)
+  (let 
+    (
+      (total-signers (var-get signer-count))
+      (percentage (var-get approval-percentage))
+    )
+    (if (is-eq total-signers u0)
+      u0
+      (let
+        (
+          (required-raw (/ (* total-signers percentage) u100))
+          ;; Round up if there's a remainder
+          (has-remainder (> (* required-raw u100) (* total-signers percentage)))
+        )
+        (if has-remainder
+          (+ required-raw u1)
+          required-raw
+        )
+      )
+    )
+  ))
 
 ;; Get the number of all signers
 (define-read-only (get-signer-count)
@@ -82,24 +116,23 @@
 (define-read-only (has-approved (signer principal))
   (default-to false (map-get? proposal-approvals signer)))
 
-;; Get current admin
-(define-read-only (get-admin)
-  (ok (var-get admin)))
-
 ;; Public functions
 
 ;; Set up the treasury
-(define-public (setup (new-admin principal) (initial-required-approvals uint))
+(define-public (setup (new-admin principal) (initial-percentage uint))
   (begin
     ;; Check if already set up
     (asserts! (not (var-get is-setup)) ERR_ALREADY_SETUP)
     
+    ;; Validate percentage
+    (asserts! (and (>= initial-percentage u1) (<= initial-percentage u100)) ERR_INVALID_APPROVAL_PERCENTAGE)
+    
     ;; Validate admin address
     (asserts! (not (is-eq new-admin NULL_ADDRESS)) ERR_NULL_ADDRESS)
     
-    ;; Set admin and required approvals
+    ;; Set admin and mark as set up
     (var-set admin new-admin)
-    (var-set required-approvals initial-required-approvals)
+    (var-set approval-percentage initial-percentage)
     (var-set is-setup true)
     
     (ok true)))
@@ -146,39 +179,25 @@
     
     (ok true)))
 
-;; Set required approvals - only admin can change
-(define-public (set-required-approvals (new-required uint))
+;; Change approval percentage - only admin can change
+(define-public (set-approval-percentage (new-percentage uint))
   (begin
     ;; Check if contract is set up
     (asserts! (var-get is-setup) ERR_NOT_SETUP)
     
-    ;; Only admin can change required approvals
+    ;; Only admin can change percentage
     (asserts! (is-admin) ERR_NOT_AUTHORIZED)
     
-    ;; Set new required approvals
-    (var-set required-approvals new-required)
+    ;; Validate percentage
+    (asserts! (and (>= new-percentage u1) (<= new-percentage u100)) ERR_INVALID_APPROVAL_PERCENTAGE)
+    
+    ;; Set new percentage
+    (var-set approval-percentage new-percentage)
     
     (ok true)))
 
-;; Transfer admin rights directly - only admin can transfer
-(define-public (transfer-admin (new-admin principal))
-  (begin
-    ;; Check if contract is set up
-    (asserts! (var-get is-setup) ERR_NOT_SETUP)
-    
-    ;; Only admin can transfer admin rights
-    (asserts! (is-admin) ERR_NOT_AUTHORIZED)
-    
-    ;; Validate new admin address
-    (asserts! (not (is-eq new-admin NULL_ADDRESS)) ERR_NULL_ADDRESS)
-    
-    ;; Update admin
-    (var-set admin new-admin)
-    
-    (ok true)))
-
-;; Create a new admin transfer proposal - only signers can create
-(define-public (propose-admin-transfer (new-admin principal))
+;; Create a new proposal - only signers can create
+(define-public (create-proposal (beneficiary principal))
   (begin
     ;; Check if contract is set up
     (asserts! (var-get is-setup) ERR_NOT_SETUP)
@@ -189,12 +208,14 @@
     ;; Check that no proposal is active
     (asserts! (not (var-get proposal-active)) ERR_PROPOSAL_IN_PROGRESS)
     
-    ;; Validate new admin address
-    (asserts! (not (is-eq new-admin NULL_ADDRESS)) ERR_NULL_ADDRESS)
+    ;; Validate beneficiary address
+    (asserts! (not (is-eq beneficiary NULL_ADDRESS)) ERR_NULL_ADDRESS)
     
     ;; Set proposal state
     (var-set proposal-active true)
-    (var-set proposal-new-admin (some new-admin))
+    (var-set proposal-creator (some tx-sender))
+    (var-set proposal-beneficiary (some beneficiary))
+    (var-set proposal-deadline (+ burn-block-height (* PROPOSAL_VALIDITY_DAYS SECONDS_IN_DAY)))
     
     ;; Clear previous approvals
     (var-set approval-count u0)
@@ -220,6 +241,9 @@
     ;; Check if signer already approved
     (asserts! (not (has-approved tx-sender)) ERR_ALREADY_APPROVED)
     
+    ;; Check if proposal period is still valid
+    (asserts! (<= burn-block-height (var-get proposal-deadline)) ERR_PROPOSAL_EXPIRED)
+    
     ;; Add approval
     (map-set proposal-approvals tx-sender true)
     (var-set approval-count (+ (var-get approval-count) u1))
@@ -235,20 +259,24 @@
     ;; Check that a proposal is active
     (asserts! (var-get proposal-active) ERR_NO_PROPOSAL_EXISTS)
     
-    ;; Check if enough approvals
-    (asserts! (>= (var-get approval-count) (var-get required-approvals)) ERR_INSUFFICIENT_APPROVALS)
+    ;; Check if proposal period is still valid
+    (asserts! (<= burn-block-height (var-get proposal-deadline)) ERR_PROPOSAL_EXPIRED)
     
-    ;; Get the proposed new admin and validate
-    (let ((new-admin (unwrap! (var-get proposal-new-admin) ERR_NOT_SETUP)))
-      ;; Double-check the new admin is valid (extra safety)
-      (asserts! (not (is-eq new-admin NULL_ADDRESS)) ERR_NULL_ADDRESS)
+    ;; Check if enough approvals
+    (asserts! (>= (var-get approval-count) (calculate-required-approvals)) ERR_INSUFFICIENT_APPROVALS)
+    
+    ;; Get the proposed beneficiary and validate
+    (let ((beneficiary (unwrap! (var-get proposal-beneficiary) ERR_NOT_SETUP)))
+      ;; Double-check the beneficiary is valid (extra safety)
+      (asserts! (not (is-eq beneficiary NULL_ADDRESS)) ERR_NULL_ADDRESS)
       
       ;; Update admin
-      (var-set admin new-admin)
+      (var-set admin beneficiary)
       
       ;; Reset proposal state
       (var-set proposal-active false)
-      (var-set proposal-new-admin none)
+      (var-set proposal-creator none)
+      (var-set proposal-beneficiary none)
       (var-set approval-count u0)
     )
     
@@ -268,7 +296,8 @@
     
     ;; Reset proposal state
     (var-set proposal-active false)
-    (var-set proposal-new-admin none)
+    (var-set proposal-creator none)
+    (var-set proposal-beneficiary none)
     (var-set approval-count u0)
     
     (ok true)))
@@ -309,3 +338,7 @@
     ;; Transfer STX
     (stx-transfer? amount tx-sender recipient)
   ))
+
+;; Get current admin
+(define-read-only (get-admin)
+  (ok (var-get admin)))
